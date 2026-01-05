@@ -727,3 +727,165 @@ Document-grounded synthesis:
 | Ingestion rate | 100+ pages/min | ~150 pages/min |
 | Memory footprint | < 2GB | ~1GB |
 | Index size (1k pages) | ~50MB | ~30MB |
+
+---
+
+## MCP Tools - Complete Reference
+
+This section provides detailed architectural documentation for all 7 MCP tools.
+
+### Tool Overview Matrix
+
+| Tool | Category | Data Source | LLM Required | Latency |
+|------|----------|-------------|--------------|---------|
+| `search_and_summarize` | 🎯 Primary | Qdrant + Confluence + LLM | Yes | 5-15s |
+| `search_documentation` | Search | Qdrant | No | 200-400ms |
+| `read_page` | Content | Confluence | No | 500ms-1.5s |
+| `get_child_pages` | Navigation | Confluence | No | 300-800ms |
+| `get_page_metadata` | Metadata | Confluence | No | 200-500ms |
+| `summarize_page` | Synthesis | Confluence + LLM | Yes | 2-5s |
+| `answer_from_page` | Synthesis | Confluence + LLM | Yes | 2-5s |
+
+---
+
+### Tool 1: `search_and_summarize` 🎯
+
+**Purpose**: Complete document-grounded question answering pipeline.
+
+**Why This is the Main Tool**: It combines search, fetch, and synthesis into a single call with anti-hallucination protection.
+
+**Architecture Flow**:
+
+```
+User Question: "What is Kafka and how does replication work?"
+         │
+         ▼
+┌─────────────────────┐
+│  1. HYBRID SEARCH   │  query → HybridSearcher → Qdrant
+│                     │  Returns: Top 5 page IDs + metadata
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  2. LIVE FETCH      │  page_ids → LiveFetcher → Confluence API
+│                     │  Returns: Fresh content for each page
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  3. COMBINE CONTEXT │  Concatenate all documents
+│                     │  ⚠️ User question is NOT included!
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  4. LLM SYNTHESIS   │  Documents → LLM → Bullet points
+│                     │  Prompt: "Summarize these documents"
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  5. GROUNDING CHECK │  Token overlap validation
+│                     │  Score < 0.5 triggers warning
+└──────────┬──────────┘
+           │
+           ▼
+Output: {summary: [...], sources: [...], grounding_score: 0.87}
+```
+
+**Anti-Hallucination Design**:
+- Traditional RAG: Question + Documents → LLM (LLM may add external knowledge)
+- This System: Documents ONLY → LLM (forced to use only provided content)
+
+---
+
+### Tool 2: `search_documentation`
+
+**Purpose**: Hybrid search with semantic + keyword matching.
+
+**Pipeline**:
+1. **Dense Embedding** (bge-small-en): Captures semantic meaning
+2. **Sparse Embedding** (Splade): Captures exact keywords
+3. **RRF Fusion**: Combines both ranked lists
+4. **FlashRank Reranker**: Cross-encoder final scoring
+
+**Returns**: Page summaries with scores, NOT full content.
+
+---
+
+### Tool 3: `read_page`
+
+**Purpose**: Fetch complete page content live from Confluence.
+
+**Processing Steps**:
+1. REST API fetch with authentication
+2. HTML parsing (BeautifulSoup)
+3. Markdown conversion (tables, code, headers)
+4. Smart truncation at 12k chars
+
+---
+
+### Tool 4: `get_child_pages`
+
+**Purpose**: Navigate documentation hierarchy.
+
+**Use Case**: Discover related pages under a parent.
+
+---
+
+### Tool 5: `get_page_metadata`
+
+**Purpose**: Quick page info without content fetch.
+
+**Returns**: title, labels, parent_id, version, last_updated
+
+---
+
+### Tool 6: `summarize_page`
+
+**Purpose**: Grounded summary of a single page.
+
+**Difference from search_and_summarize**: Works on ONE specific page, not search results.
+
+---
+
+### Tool 7: `answer_from_page`
+
+**Purpose**: Answer specific question from one page only.
+
+**Key Feature**: Returns "NOT_FOUND" if answer isn't in the document.
+
+---
+
+### Tool Selection Decision Tree
+
+```
+What type of request?
+│
+├── General question about topics
+│   └─► search_and_summarize (RECOMMENDED)
+│
+├── Specific page operations
+│   ├── Need full content → read_page
+│   ├── Need summary → summarize_page
+│   └── Have a specific question → answer_from_page
+│
+├── Exploration/Discovery
+│   ├── Find pages by topic → search_documentation
+│   └── Browse hierarchy → get_child_pages
+│
+└── Quick info
+    └─► get_page_metadata
+```
+
+---
+
+## Security Considerations
+
+| Aspect | Implementation |
+|--------|----------------|
+| **Authentication** | PAT tokens in environment variables only |
+| **Grounding** | Prevents LLM hallucination via prompt design |
+| **Rate Limiting** | Automatic retry with exponential backoff |
+| **Content Limits** | 12k char truncation prevents context overflow |
+| **Input Validation** | Pydantic validates all inputs |
