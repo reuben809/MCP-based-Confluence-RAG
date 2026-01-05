@@ -290,6 +290,8 @@ def run_ingestion(
     max_pages: Optional[int] = None,
     recreate: bool = False,
     incremental: bool = True,
+    use_async: bool = True,
+    max_concurrent: int = 10,
 ) -> int:
     """
     Run the full ingestion pipeline.
@@ -298,6 +300,8 @@ def run_ingestion(
         max_pages: Maximum pages to index
         recreate: If True, recreate the collection
         incremental: If True, skip unchanged pages
+        use_async: If True, use async parallel fetching (5-10x faster)
+        max_concurrent: Max concurrent requests for async mode
         
     Returns:
         Number of pages indexed
@@ -306,25 +310,52 @@ def run_ingestion(
     
     logger.info(f"Starting ingestion for space: {settings.confluence_space_key}")
     logger.info(f"Max pages: {max_pages}, Recreate: {recreate}, Incremental: {incremental}")
+    logger.info(f"Mode: {'Async parallel' if use_async else 'Sync sequential'}")
     
     # Initialize embedder
     embedder = SkeletonEmbedder()
     embedder.init_collection(recreate=recreate)
     
-    # Initialize Confluence client
-    client = ConfluenceClient()
-    
-    def page_generator():
-        """Yield pages with their content."""
-        for page in client.get_all_pages(max_pages=max_pages):
-            html_content = client.get_page_content(page.page_id)
-            if html_content is not None:
-                yield page, html_content
+    if use_async:
+        # Use async parallel fetching (5-10x faster)
+        from ingestion.async_fetcher import AsyncConfluenceFetcher
+        
+        logger.info(f"Using async parallel fetch with {max_concurrent} concurrent requests")
+        fetcher = AsyncConfluenceFetcher(max_concurrent=max_concurrent)
+        results = fetcher.fetch_all_pages(max_pages=max_pages, show_progress=True)
+        
+        def page_generator():
+            """Yield pages from async fetch results."""
+            from ingestion.confluence_client import PageSummary
+            for result in results:
+                if result.html_content is not None:
+                    page = PageSummary(
+                        page_id=result.page_id,
+                        title=result.title,
+                        url=result.url,
+                        space_key=result.space_key,
+                        parent_id=result.parent_id,
+                    )
+                    yield page, result.html_content
+        
+        total = len([r for r in results if r.html_content is not None])
+    else:
+        # Use sync sequential fetching (original method)
+        client = ConfluenceClient()
+        
+        def page_generator():
+            """Yield pages with their content."""
+            for page in client.get_all_pages(max_pages=max_pages):
+                html_content = client.get_page_content(page.page_id)
+                if html_content is not None:
+                    yield page, html_content
+        
+        total = max_pages
     
     # Index pages
     indexed = embedder.index_pages(
         pages=page_generator(),
-        total=max_pages,
+        total=total,
         incremental=incremental,
     )
     
