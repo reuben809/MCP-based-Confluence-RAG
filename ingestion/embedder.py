@@ -1,205 +1,354 @@
-from __future__ import annotations
+"""
+Skeleton Embedder
+
+Generates hybrid embeddings (dense + sparse) for skeleton pages
+and stores them in Qdrant. No MongoDB dependency.
+
+Pipeline:
+1. Fetch pages from Confluence
+2. Build skeleton representations
+3. Generate dense + sparse embeddings
+4. Upsert to Qdrant with payloads
+
+Features:
+- Incremental indexing (hash-based change detection)
+- Batch embedding for efficiency
+- Progress tracking
+- Graceful error handling
+"""
 
 import logging
 import uuid
-import sys
-import os
-import ssl
-from typing import List, Dict, Any
+from typing import Iterator, List, Optional, Tuple
 
-# --- MANUAL MODEL LOADING ---
-# Since HuggingFace is blocked, models are loaded from local cache
-# Path is configurable via FASTEMBED_CACHE_PATH in .env
-# ----------------------------
-
-from dotenv import load_dotenv
-from pymongo import MongoClient
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
-from fastembed import TextEmbedding, SparseTextEmbedding
+from fastembed import SparseTextEmbedding, TextEmbedding
+from qdrant_client import QdrantClient, models
+from tqdm import tqdm
 
 from config.settings import settings
-from ingestion.text_cleaner import hierarchical_chunks
+from ingestion.confluence_client import ConfluenceClient, PageSummary
+from ingestion.skeleton_builder import PageSkeleton, SkeletonBuilder
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+# Namespace for deterministic UUIDs
+SKELETON_NAMESPACE = uuid.UUID("1b671a64-40d5-491e-99b0-da01ff1f3341")
 
-# Constants
-# BAAI/bge-small-en-v1.5 = 384 dimensions
-DENSE_MODEL_NAME = settings.embedding_model or "BAAI/bge-small-en-v1.5"
-SPARSE_MODEL_NAME = "prithivida/Splade_PP_en_v1" 
-BATCH_SIZE = 64  # Increased batch size as FastEmbed is efficient
-CONFLUENCE_NAMESPACE = uuid.UUID("1b671a64-40d5-491e-99b0-da01ff1f3341")
 
-def init_qdrant(qdrant: QdrantClient, collection_name: str):
-    """Initialize Qdrant collection with Dense and Sparse configurations."""
-    if not qdrant.collection_exists(collection_name):
-        logger.info(f"Creating collection {collection_name}...")
-        qdrant.create_collection(
-            collection_name=collection_name,
-            vectors_config={
-                "dense": models.VectorParams(
-                    size=384,  # bge-small-en-v1.5 dimension
-                    distance=models.Distance.COSINE
-                )
-            },
-            sparse_vectors_config={
-                "sparse": models.SparseVectorParams(
-                    index=models.SparseIndexParams(
-                        on_disk=False,
-                    )
-                )
-            }
-        )
-        logger.info("Collection created.")
-    else:
-        logger.info(f"Collection {collection_name} exists.")
-
-def run():
+class SkeletonEmbedder:
     """
-    Synchronous embedding pipeline using FastEmbed (CPU optimized).
-    Generates both Dense and Sparse vectors locally.
-    """
-    # 1. Connect to DBs
-    mongo = MongoClient(settings.mongo_uri)[settings.mongo_db]["pages"]
-    qdrant = QdrantClient(url=settings.qdrant_url)
-    COLLECTION_NAME = settings.qdrant_collection  # Should be 'confluence_vectors_fastembed'
-
-    init_qdrant(qdrant, COLLECTION_NAME)
-
-    # DEBUG: List directories to understand what FastEmbed sees
-    cache_path = settings.fastembed_cache_path
-    logger.info(f"DEBUG: Inspecting {cache_path}...")
-    if os.path.exists(cache_path):
-        for root, dirs, files in os.walk(cache_path):
-            logger.info(f"Found: {root} -> {dirs}, {files}")
-    else:
-        logger.warning(f"Cache path does not exist: {cache_path}")
-
-    # 2. Initialize Models (Lazy loading)
-    # Using configurable cache path from settings
-    dense_model = TextEmbedding(
-        model_name="BAAI/bge-small-en-v1.5", 
-        cache_dir=settings.fastembed_cache_path, 
-        local_files_only=True
-    )
+    Generates and stores skeleton embeddings in Qdrant.
     
-    logger.info("Loading Sparse Model: prithivida/Splade_PP_en_v1...")
-    sparse_model = SparseTextEmbedding(
-        model_name="prithivida/Splade_PP_en_v1", 
-        cache_dir=settings.fastembed_cache_path, 
-        local_files_only=True
-    )
+    Uses hybrid embeddings (dense + sparse) for optimal search performance.
+    """
 
-    # 3. Collect Data
-    logger.info("Reading docs from MongoDB...")
-    all_chunks = []
-    chunk_metadata = []
-
-    # Iterate over all pages
-    cursor = mongo.find({})
-    for doc in cursor:
-        # Create chunks
-        for chunk in hierarchical_chunks(doc["content_text"]):
-            # Deterministic UUID
-            chunk_uuid = str(
-                uuid.uuid5(
-                    CONFLUENCE_NAMESPACE,
-                    f"{doc['page_id']}_{chunk['parent_index']}_{chunk['child_index']}"
-                )
-            )
-            
-            chunk_text = chunk["child_text"]
-            all_chunks.append(chunk_text)
-            
-            # Extract link metadata from MongoDB document
-            linked_page_ids = doc.get("internal_links", [])
-            if isinstance(linked_page_ids, list):
-                # Extract page IDs from URLs if needed
-                linked_page_ids = [str(link) for link in linked_page_ids[:10]]  # Limit to 10
-            else:
-                linked_page_ids = []
-            
-            # Detect if chunk contains table data
-            has_table = "| " in chunk_text or "|-" in chunk_text
-            
-            chunk_metadata.append({
-                "id": chunk_uuid,
-                "payload": {
-                    "page_id": doc["page_id"],
-                    "title": doc["title"],
-                    "url": doc["url"],
-                    "chunk": chunk_text,
-                    "parent_text": chunk["parent_text"],
-                    "parent_index": chunk["parent_index"],
-                    "child_index": chunk["child_index"],
-                    # New metadata
-                    "linked_page_ids": linked_page_ids,
-                    "has_table": has_table,
-                }
-            })
-
-    total_chunks = len(all_chunks)
-    logger.info(f"Found {total_chunks} chunks to embed.")
-
-    if total_chunks == 0:
-        logger.warning("No chunks found. Exiting.")
-        return
-
-    # 4. Batch Processing
-    # FastEmbed is efficient, but we process in batches to control memory and Qdrant upsert size
-    for i in range(0, total_chunks, BATCH_SIZE):
-        batch_end = min(i + BATCH_SIZE, total_chunks)
-        batch_texts = all_chunks[i:batch_end]
-        batch_meta = chunk_metadata[i:batch_end]
+    def __init__(
+        self,
+        qdrant_url: Optional[str] = None,
+        collection_name: Optional[str] = None,
+        dense_model: Optional[str] = None,
+        sparse_model: Optional[str] = None,
+        cache_path: Optional[str] = None,
+        batch_size: int = 64,
+    ):
+        """
+        Initialize embedder.
         
-        logger.info(f"Processing batch {i}/{total_chunks}...")
+        Args:
+            qdrant_url: Qdrant server URL
+            collection_name: Collection to use
+            dense_model: Dense embedding model name
+            sparse_model: Sparse embedding model name  
+            cache_path: Path to model cache
+            batch_size: Batch size for embedding
+        """
+        self.qdrant_url = qdrant_url or settings.qdrant_url
+        self.collection_name = collection_name or settings.qdrant_collection
+        self.cache_path = cache_path or settings.fastembed_cache_path
+        self.batch_size = batch_size
+        
+        # Initialize clients
+        self.qdrant = QdrantClient(url=self.qdrant_url)
+        
+        # Model names
+        self.dense_model_name = dense_model or settings.dense_model
+        self.sparse_model_name = sparse_model or settings.sparse_model
+        
+        # Lazy-loaded models
+        self._dense_model: Optional[TextEmbedding] = None
+        self._sparse_model: Optional[SparseTextEmbedding] = None
 
-        # Generate Dense Embeddings (Generator -> List)
-        # list(dense_model.embed(batch_texts)) returns list of numpy arrays
-        batch_dense = list(dense_model.embed(batch_texts))
+    @property
+    def dense_model(self) -> TextEmbedding:
+        """Lazy-load dense model."""
+        if self._dense_model is None:
+            logger.info(f"Loading dense model: {self.dense_model_name}")
+            self._dense_model = TextEmbedding(
+                model_name=self.dense_model_name,
+                cache_dir=self.cache_path,
+                local_files_only=True,
+            )
+        return self._dense_model
 
-        # Generate Sparse Embeddings
-        # list(sparse_model.embed(batch_texts)) returns list of SparseEmbedding objects
-        batch_sparse = list(sparse_model.embed(batch_texts))
+    @property
+    def sparse_model(self) -> SparseTextEmbedding:
+        """Lazy-load sparse model."""
+        if self._sparse_model is None:
+            logger.info(f"Loading sparse model: {self.sparse_model_name}")
+            self._sparse_model = SparseTextEmbedding(
+                model_name=self.sparse_model_name,
+                cache_dir=self.cache_path,
+                local_files_only=True,
+            )
+        return self._sparse_model
 
-        points = []
-        for idx, (meta, dense, sparse) in enumerate(zip(batch_meta, batch_dense, batch_sparse)):
+    def init_collection(self, recreate: bool = False) -> None:
+        """
+        Initialize Qdrant collection with hybrid vector config.
+        
+        Args:
+            recreate: If True, delete and recreate collection
+        """
+        if recreate and self.qdrant.collection_exists(self.collection_name):
+            logger.warning(f"Deleting existing collection: {self.collection_name}")
+            self.qdrant.delete_collection(self.collection_name)
+        
+        if not self.qdrant.collection_exists(self.collection_name):
+            logger.info(f"Creating collection: {self.collection_name}")
+            self.qdrant.create_collection(
+                collection_name=self.collection_name,
+                vectors_config={
+                    "dense": models.VectorParams(
+                        size=384,  # bge-small-en-v1.5 dimension
+                        distance=models.Distance.COSINE,
+                    )
+                },
+                sparse_vectors_config={
+                    "sparse": models.SparseVectorParams(
+                        index=models.SparseIndexParams(on_disk=False)
+                    )
+                },
+            )
+            logger.info("Collection created successfully")
+        else:
+            logger.info(f"Collection {self.collection_name} already exists")
+
+    def get_existing_hashes(self) -> dict:
+        """
+        Get content hashes for all existing pages.
+        
+        Returns:
+            Dict mapping page_id to content_hash
+        """
+        hashes = {}
+        
+        try:
+            # Scroll through all points to get hashes
+            offset = None
+            while True:
+                result = self.qdrant.scroll(
+                    collection_name=self.collection_name,
+                    limit=1000,
+                    offset=offset,
+                    with_payload=["page_id", "content_hash"],
+                )
+                
+                points, next_offset = result
+                for point in points:
+                    if point.payload:
+                        page_id = point.payload.get("page_id")
+                        content_hash = point.payload.get("content_hash")
+                        if page_id and content_hash:
+                            hashes[page_id] = content_hash
+                
+                if next_offset is None:
+                    break
+                offset = next_offset
+                
+        except Exception as e:
+            logger.warning(f"Could not fetch existing hashes: {e}")
             
-            # Convert SparseEmbedding to Qdrant format
-            # sparse object has .indices and .values
+        return hashes
+
+    def embed_batch(
+        self,
+        skeletons: List[PageSkeleton],
+    ) -> List[models.PointStruct]:
+        """
+        Generate embeddings for a batch of skeletons.
+        
+        Args:
+            skeletons: List of PageSkeleton objects
+            
+        Returns:
+            List of PointStruct ready for upsert
+        """
+        texts = [s.to_skeleton_text() for s in skeletons]
+        
+        # Generate embeddings
+        dense_embeddings = list(self.dense_model.embed(texts))
+        sparse_embeddings = list(self.sparse_model.embed(texts))
+        
+        # Create points
+        points = []
+        for skeleton, dense, sparse in zip(skeletons, dense_embeddings, sparse_embeddings):
+            # Deterministic UUID from page_id
+            point_id = str(uuid.uuid5(SKELETON_NAMESPACE, skeleton.page_id))
+            
             sparse_vector = models.SparseVector(
                 indices=sparse.indices.tolist(),
-                values=sparse.values.tolist()
+                values=sparse.values.tolist(),
             )
+            
+            points.append(models.PointStruct(
+                id=point_id,
+                vector={
+                    "dense": dense.tolist(),
+                    "sparse": sparse_vector,
+                },
+                payload=skeleton.to_payload(),
+            ))
+            
+        return points
 
-            points.append(
-                models.PointStruct(
-                    id=meta["id"],
-                    vector={
-                        "dense": dense.tolist(),
-                        "sparse": sparse_vector
-                    },
-                    payload=meta["payload"]
+    def index_pages(
+        self,
+        pages: Iterator[Tuple[PageSummary, str]],
+        total: Optional[int] = None,
+        incremental: bool = True,
+    ) -> int:
+        """
+        Index pages into Qdrant.
+        
+        Args:
+            pages: Iterator of (PageSummary, html_content) tuples
+            total: Total count for progress bar (optional)
+            incremental: If True, skip unchanged pages
+            
+        Returns:
+            Number of pages indexed
+        """
+        # Get existing hashes for incremental indexing
+        existing_hashes = self.get_existing_hashes() if incremental else {}
+        logger.info(f"Found {len(existing_hashes)} existing pages in collection")
+        
+        # Build skeletons
+        builder = SkeletonBuilder(base_url=settings.confluence_base_url)
+        
+        batch: List[PageSkeleton] = []
+        indexed = 0
+        skipped = 0
+        
+        pbar = tqdm(pages, total=total, desc="Indexing pages")
+        
+        for page_summary, html_content in pbar:
+            # Build skeleton
+            skeleton = builder.build_skeleton(
+                page_id=page_summary.page_id,
+                title=page_summary.title,
+                html_content=html_content,
+                space_key=page_summary.space_key,
+                url=page_summary.url,
+                parent_id=page_summary.parent_id,
+            )
+            
+            # Check if changed (incremental mode)
+            if incremental:
+                old_hash = existing_hashes.get(page_summary.page_id)
+                if old_hash and old_hash == skeleton.content_hash:
+                    skipped += 1
+                    pbar.set_postfix(indexed=indexed, skipped=skipped)
+                    continue
+            
+            batch.append(skeleton)
+            
+            # Process batch
+            if len(batch) >= self.batch_size:
+                points = self.embed_batch(batch)
+                self.qdrant.upsert(
+                    collection_name=self.collection_name,
+                    points=points,
                 )
+                indexed += len(batch)
+                batch = []
+                pbar.set_postfix(indexed=indexed, skipped=skipped)
+        
+        # Process remaining batch
+        if batch:
+            points = self.embed_batch(batch)
+            self.qdrant.upsert(
+                collection_name=self.collection_name,
+                points=points,
             )
+            indexed += len(batch)
+        
+        logger.info(f"Indexing complete. Indexed: {indexed}, Skipped: {skipped}")
+        return indexed
 
-        # Upsert to Qdrant
-        qdrant.upsert(
-            collection_name=COLLECTION_NAME,
-            points=points
-        )
+
+def run_ingestion(
+    max_pages: Optional[int] = None,
+    recreate: bool = False,
+    incremental: bool = True,
+) -> int:
+    """
+    Run the full ingestion pipeline.
     
-    logger.info("Ingestion complete! 🚀")
+    Args:
+        max_pages: Maximum pages to index
+        recreate: If True, recreate the collection
+        incremental: If True, skip unchanged pages
+        
+    Returns:
+        Number of pages indexed
+    """
+    max_pages = max_pages or settings.ingestion_max_pages
+    
+    logger.info(f"Starting ingestion for space: {settings.confluence_space_key}")
+    logger.info(f"Max pages: {max_pages}, Recreate: {recreate}, Incremental: {incremental}")
+    
+    # Initialize embedder
+    embedder = SkeletonEmbedder()
+    embedder.init_collection(recreate=recreate)
+    
+    # Initialize Confluence client
+    client = ConfluenceClient()
+    
+    def page_generator():
+        """Yield pages with their content."""
+        for page in client.get_all_pages(max_pages=max_pages):
+            html_content = client.get_page_content(page.page_id)
+            if html_content is not None:
+                yield page, html_content
+    
+    # Index pages
+    indexed = embedder.index_pages(
+        pages=page_generator(),
+        total=max_pages,
+        incremental=incremental,
+    )
+    
+    logger.info(f"Ingestion complete! {indexed} pages indexed.")
+    return indexed
+
 
 if __name__ == "__main__":
-    try:
-        run()
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        logger.error(f"FATAL ERROR: {e}")
-        sys.exit(1)
+    import argparse
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+    
+    parser = argparse.ArgumentParser(description="Index Confluence pages")
+    parser.add_argument("--max-pages", type=int, default=None, help="Max pages to index")
+    parser.add_argument("--recreate", action="store_true", help="Recreate collection")
+    parser.add_argument("--full", action="store_true", help="Full reindex (no incremental)")
+    
+    args = parser.parse_args()
+    
+    run_ingestion(
+        max_pages=args.max_pages,
+        recreate=args.recreate,
+        incremental=not args.full,
+    )
